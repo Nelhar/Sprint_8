@@ -1,0 +1,47 @@
+@startuml 04_edi_saga
+title EDI-сага ORDERS → DESADV → INVOIC (целевое состояние, B2B/EDI с постоплатой)\nБез распределённых блокировок и междоменных JOIN: Outbox + Idempotent Consumer + компенсации\n(B2C-предоплата: hold → резерв → capture / возврат — см. appendix, раздел I)
+
+participant "EDI-хаб холдинга" as EDI
+participant "EDI Gateway (ACL)" as GW
+participant "Order Saga\nOrchestrator (Temporal)" as SAGA
+participant "Orders Service" as ORD
+participant "Warehouse Service" as WH
+participant "Billing Service" as BILL
+participant "Payment Service" as PAY
+queue "Kafka" as K
+
+EDI -> GW : ORDERS (EANCOM)
+GW -> GW : валидация, дедупликация по\nmessage_id (Idempotent Consumer)
+GW -> SAGA : StartOrderSaga(order_ref)
+SAGA -> ORD : CreateOrder
+ORD -> K : OrderCreated (outbox, одна транзакция)
+SAGA -> WH : ReserveStock(order_id)
+alt товар есть
+  WH -> K : StockReserved
+  WH -> SAGA : reserved
+  ... комплектация, маркировка, ВГХ ...
+  WH -> K : ShipmentDispatched (DESADV)
+  SAGA -> GW : SendDESADV
+  GW -> EDI : DESADV
+  SAGA -> BILL : IssueInvoice(order_id)\n**только в состоянии DISPATCHED**
+  BILL -> K : InvoiceIssued (INVOIC)
+  K -> PAY : InvoiceIssued → счёт разрешён к оплате
+  SAGA -> GW : SendINVOIC
+  GW -> EDI : INVOIC / УПД (КЭП через оператора ЭДО)
+  PAY -> K : PaymentConfirmed(invoice_id)
+  K -> BILL : mark PAID (идемпотентно по payment_id)
+else товара нет / таймаут склада (SLA 60 с, 3 повтора)
+  WH -> SAGA : rejected / timeout
+  SAGA -> ORD : CancelOrder (компенсация)
+  SAGA -> GW : ORDRSP: отказ
+  GW -> EDI : ORDRSP
+  note over BILL : INVOIC не создаётся →\nоплата невозможна: у счёта нет состояния ISSUED
+end
+
+note over PAY, BILL
+  Защита от аномалии «оплата без товара»:
+  Payment Service принимает платёж только по invoice в статусе ISSUED
+  (событие InvoiceIssued приходит после ShipmentDispatched).
+  Платёж по отменённому счёту → автоматический возврат (компенсация).
+end note
+@enduml

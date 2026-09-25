@@ -1,0 +1,48 @@
+@startuml 02_transition
+!pragma layout smetana
+!include <C4/C4_Container>
+
+LAYOUT_TOP_DOWN()
+LAYOUT_WITH_LEGEND()
+
+title Fast Cargo — Transition Architecture 1 (через 3 месяца)\nВесь трафик с ПДн — на площадке; в облако уходят только токенизированные события. Код монолита не меняется
+
+Person(client, "Клиент B2B/B2C", "ЛК (web)")
+Person(courier, "Водитель / курьер", "Мобильное приложение")
+System_Ext(bank, "Банк-эквайер", "Вебхуки об оплате")
+System_Ext(dwh, "DWH холдинга", "ЦОД холдинга (out-of-scope)")
+
+System_Boundary(legacy, "Текущая площадка — ИСПДн: все ПДн и весь пользовательский трафик") {
+  Container(apisix, "API Gateway", "Apache APISIX, 2 VM active-active", "Завершение TLS, таймауты, rate limit,\ncircuit breaker, раздельные upstream\nweb/mobile (Bulkhead)")
+  Container(inbox, "Webhook Inbox + Relay", "Go", "HMAC → inbox_db → 200 OK.\nRelay: ровно одна доставка, дедуп по payment_id,\nподтверждение по CDC-статусу")
+  ContainerDb(inboxDb, "inbox_db", "PostgreSQL (отдельный инстанс)", "Вебхуки, retention 30 дней")
+  Container(gw, "Шлюз FastAPI", "Python", "Только проксирование к монолиту")
+  Container(mono, "Монолит", "Без изменений кода")
+  ContainerDb(pg, "PostgreSQL primary", "wal_level=logical", "Мастер (SSOT); публикация создана здесь")
+  ContainerDb(pgs, "PostgreSQL hot-standby", "PG ≥ 16, hot_standby_feedback", "Логический слот Debezium")
+  Container(dbz, "Kafka Connect + Debezium + SMT", "snapshot.mode=no_data,\npublication.autocreate.mode=disabled", "ACL Stream-Mapper + токенизация в памяти;\nсырые события никуда не пишутся")
+  ContainerDb(vault, "Token Vault", "PostgreSQL, ГОСТ, изолированный сегмент", "UUID ↔ ПДн")
+}
+
+System_Boundary(cloud, "Облачный сегмент РФ — только обезличенная аналитика (вне ИСПДн), IaC") {
+  ContainerQueue(kan, "Kafka: analytics.*", "Avro + Schema Registry, 3 зоны", "Только токены")
+  ContainerDb(ch, "ClickHouse", "Managed, 2 реплики", "Оперативные витрины, отчёты «Финансов»")
+}
+
+Rel(client, apisix, "HTTPS")
+Rel(courier, apisix, "HTTPS")
+Rel(bank, apisix, "Вебхуки")
+Rel(apisix, gw, "Проксирование")
+Rel(apisix, inbox, "/webhooks/*")
+Rel(inbox, inboxDb, "Запись до ответа банку")
+Rel(inbox, gw, "Relay")
+Rel(gw, mono, "HTTP")
+Rel(mono, pg, "OLTP")
+Rel(pg, pgs, "Физическая репликация")
+Rel(dbz, pgs, "Логический слот (WAL)")
+Rel(dbz, vault, "Токенизация")
+Rel(dbz, kan, "Обезличенные события (2 IPsec ГОСТ)")
+Rel(kan, inbox, "analytics.invoices: подтверждение статуса")
+Rel(kan, ch, "Kafka Engine, flush 500 мс")
+Rel_L(kan, dwh, "Поток в DWH, p95 ≤ 3 с")
+@enduml

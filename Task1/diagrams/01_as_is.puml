@@ -1,0 +1,40 @@
+@startuml 01_as_is
+!pragma layout smetana
+!include <C4/C4_Container>
+
+LAYOUT_TOP_DOWN()
+LAYOUT_WITH_LEGEND()
+
+title Fast Cargo — Baseline (AS-IS)\nАнтипаттерн: Shared Database + синхронная цепочка
+
+Person(client, "Клиент B2B/B2C", "Веб-кабинет")
+Person(courier, "Водитель / курьер", "Мобильное приложение")
+System_Ext(bank, "Платёжный шлюз банка", "Эквайринг карта/СБП, вебхуки")
+
+System_Boundary(front, "Фронт-офис") {
+  Container(web, "Личный кабинет", "React/JS", "Заказы, калькулятор, накладные")
+  Container(mob, "Мобильное приложение", "Flutter", "Маршрутные листы, статусы, сканер, фото")
+  Container(acq, "Модуль эквайринга", "JS SDK / API", "Оплата, фискализация")
+}
+
+System_Boundary(mw, "Middleware") {
+  Container(gw, "Интеграционный шлюз", "Python FastAPI/Uvicorn", "Синхронное проксирование всех запросов, логи API, приём вебхуков\n[SPOF: 504 при медленной БД → потеря вебхуков]")
+}
+
+System_Boundary(back, "Бэк-офис: монолит + единый BFF") {
+  Container(mono, "Монолит", "Единая кодовая база", "Заказы → Warehouse → Доставка → Финансы\n(in-process вызовы, релиз > 2 недель)")
+}
+
+ContainerDb(pg, "PostgreSQL (1 физический инстанс)", "operational / master_data / integration", "FK между доменами\n[SPOF: отчётные JOIN блокируют запись заказов и GPS]")
+
+Rel(client, web, "HTTPS")
+Rel(courier, mob, "HTTPS")
+Rel(web, acq, "Инициирует оплату")
+Rel(acq, bank, "API")
+Rel(web, gw, "REST: заказы, расчёт")
+Rel(mob, gw, "REST: координаты, статусы")
+Rel(bank, gw, "Вебхуки об оплате")
+Rel(gw, mono, "Синхронный HTTP")
+Rel(gw, pg, "Логи API, кеш")
+Rel(mono, pg, "Транзакции, GPS, справочники, тяжёлые JOIN")
+@enduml

@@ -1,0 +1,43 @@
+@startuml pdn_dfd
+!pragma layout smetana
+!include <C4/C4_Container>
+
+LAYOUT_LEFT_RIGHT()
+LAYOUT_WITH_LEGEND()
+
+title Security View — потоки ПДн и подключение CRM холдинга (152-ФЗ)\nГраницы доверия: контур ПДн | доменный контур | внешние системы холдинга
+
+System_Ext(crm, "Омниканальная CRM холдинга", "Отдельное юрлицо: договор-поручение (ст. 6 ч. 3)\nили согласие отдельным документом")
+System_Ext(dwh, "DWH холдинга", "Только обезличенные данные")
+System_Ext(soc, "SOC / SIEM холдинга", "WORM-журнал аудита")
+
+System_Boundary(perim, "Периметр (Zero Trust)") {
+  Container(gw, "API Gateway", "APISIX — PEP", "mTLS, JWT")
+  Container(opa, "PDP", "Open Policy Agent", "ABAC: роль, активное обращение,\nустройство, смена")
+}
+
+System_Boundary(domain, "Доменный контур (без ПДн)") {
+  Container(c360, "Customer 360 Read Model", "CQRS", "История заказов и перемещений\nпо customer_token")
+  ContainerQueue(kafka, "Kafka: доменные события и analytics.*", "", "Только токены; vehicle_id вместо водителя")
+}
+
+System_Boundary(pdn, "Контур ПДн — ИСПДн, предв. УЗ-3 (сегмент, МЭ + СКЗИ ГОСТ)") {
+  Container(profile, "Customer Profile Service", "", "Паспорт, телефон, e-mail;\nудаление по ст. 21 = crypto-shredding")
+  ContainerDb(vault, "Token Vault / profile_db", "PostgreSQL, ГОСТ at-rest", "UUID ↔ ПДн, отдельно от\nобезличенных данных (Приказ РКН №140)")
+  Container(tok, "PII-Tokenizer", "", "Замена ПДн на UUID до выхода события")
+}
+
+Person(courier, "Курьер", "Мобильное приложение")
+Rel(courier, gw, "Адрес/телефон получателя: только на время рейса,\nABAC (назначен на рейс, рейс активен); звонок через виртуальный номер")
+Rel(crm, gw, "1. История клиента (token)")
+Rel(gw, c360, "2. Без ПДн")
+Rel(crm, gw, "3. Раскрыть телефон (по обращению)")
+Rel(gw, opa, "4. allow / deny")
+Rel(gw, profile, "5. Только при allow")
+Rel(gw, soc, "Аудит каждой детокенизации")
+Rel(profile, vault, "")
+Rel(tok, vault, "Токенизация")
+Rel(tok, kafka, "Обезличенные события")
+Rel(kafka, c360, "Проекция")
+Rel(kafka, dwh, "Обезличенные события")
+@enduml

@@ -1,0 +1,98 @@
+@startuml 03_to_be
+!pragma layout smetana
+!include <C4/C4_Container>
+
+LAYOUT_TOP_DOWN()
+LAYOUT_WITH_LEGEND()
+
+title Fast Cargo — Target Architecture (через 12 месяцев)\nEDA-микросервисы, Database-per-Service, Outbox + Saga, изолированные контуры ПДн и платежей
+
+Person(client, "Клиент B2B/B2C")
+Person(courier, "Водитель / курьер")
+System_Ext(iot, "IoT-терминалы ГЛОНАСС/GPS", "EGTS / Wialon IPS, до 3000 RPS")
+System_Ext(acq, "Банк-эквайер + НСПК (СБП)", "Платёжная страница банка (редирект), PAN только у банка")
+System_Ext(ofd, "Облачная касса + ОФД", "54-ФЗ")
+System_Ext(edi, "EDI-хаб холдинга / оператор ЭДО", "EANCOM ORDERS, DESADV, INVOIC; УПД с КЭП")
+System_Ext(crm, "Омниканальная CRM холдинга", "Чат-боты и операторы")
+System_Ext(dwh, "DWH холдинга")
+System_Ext(soc, "SOC / SIEM холдинга", "Без дублирования")
+System_Ext(idp, "IdP холдинга", "Сотрудники")
+
+System_Boundary(edge, "Периметр (ИСПДн: аттестованная инфраструктура провайдера)") {
+  Container(apigw, "API Gateway", "Apache APISIX (PEP)", "mTLS, rate limit, circuit breaker,\nJWT (Keycloak — клиенты)")
+  Container(bffw, "BFF-web", "Kotlin/Go")
+  Container(bffm, "BFF-mobile", "Kotlin/Go")
+  Container(opa, "Policy Decision Point", "Open Policy Agent", "ABAC")
+}
+
+System_Boundary(core, "Доменные сервисы (Managed K8s, 3 зоны)") {
+  Container(orders, "Orders Service", "", "Заказы, калькулятор")
+  ContainerDb(ordersDb, "orders_db", "PostgreSQL + outbox")
+  Container(wh, "Warehouse Service", "", "Приёмка, хранение, резерв, DESADV")
+  ContainerDb(whDb, "warehouse_db", "PostgreSQL + outbox")
+  Container(dlv, "Delivery Service", "", "Рейсы, маршрутные листы;\nтолько recipient_token / driver_token")
+  ContainerDb(dlvDb, "delivery_db", "PostgreSQL + outbox")
+  Container(bill, "Billing Service", "", "Счета, акты, INVOIC")
+  ContainerDb(billDb, "billing_db", "PostgreSQL + outbox")
+  Container(saga, "Order Saga Orchestrator", "Temporal (OSS)", "ORDERS → DESADV → INVOIC, компенсации")
+  Container(ediGw, "EDI Gateway (ACL)", "", "EANCOM ↔ внутренние события")
+  Container(tele, "Telematics Ingestion", "Go", "Приём EGTS/MQTT → Kafka")
+  ContainerDb(teleDb, "ClickHouse tracks + Valkey last position", "")
+  Container(c360, "Customer 360 Read Model", "CQRS-проекция", "История заказов и перемещений по customer_token, без ПДн")
+}
+
+System_Boundary(pdn, "Контур ПДн (ИСПДн, предв. УЗ-3, отдельный сегмент)") {
+  Container(profile, "Profile Service", "", "Клиенты, получатели, водители:\nпаспорт, ФИО, адрес, телефон, e-mail;\nсвязь водитель ↔ ТС; детокенизация по ABAC")
+  ContainerDb(vault, "Token Vault / profile_db", "PostgreSQL, ГОСТ-шифрование at-rest")
+}
+
+System_Boundary(pay, "Платёжный контур (изолирован от доменов)") {
+  Container(payment, "Payment Service", "", "Создание платёжной сессии, вебхуки (HMAC), idempotency")
+  ContainerDb(payDb, "payment_db", "PostgreSQL + outbox", "Только токены и статусы, без PAN")
+}
+
+ContainerQueue(kafka, "Apache Kafka", "Managed, RF=3, Schema Registry", "Транспорт событий (не оркестратор)")
+ContainerDb(ch, "ClickHouse", "OLAP", "Отчёты, аналитика")
+
+Rel(client, apigw, "HTTPS")
+Rel(courier, apigw, "HTTPS")
+Rel(apigw, opa, "Решение о доступе")
+Rel(apigw, bffw, "")
+Rel(apigw, bffm, "")
+Rel(bffw, orders, "REST/gRPC")
+Rel(bffw, payment, "Создать платёж → redirect URL")
+Rel(bffm, dlv, "REST/gRPC")
+Rel(client, acq, "Ввод карты на странице банка (PAN не в контуре FC)")
+Rel(acq, apigw, "Вебхуки → Payment Service")
+Rel(payment, ofd, "Чек")
+Rel(iot, tele, "EGTS/MQTT")
+Rel(tele, kafka, "telematics.positions (vehicle_id, 24 партиции)")
+Rel(kafka, teleDb, "Batch insert")
+Rel(orders, ordersDb, "")
+Rel(wh, whDb, "")
+Rel(dlv, dlvDb, "")
+Rel(bill, billDb, "")
+Rel(payment, payDb, "")
+Rel(profile, vault, "")
+Rel(saga, orders, "Команды")
+Rel(saga, wh, "Резерв / DESADV")
+Rel(saga, bill, "Выставить INVOIC")
+Rel(edi, ediGw, "ORDERS")
+Rel(ediGw, saga, "Старт саги")
+Rel(ediGw, edi, "DESADV, INVOIC (УПД)")
+Rel(ordersDb, kafka, "Outbox → Debezium")
+Rel(whDb, kafka, "Outbox: StockReserved, ShipmentDispatched")
+Rel(dlvDb, kafka, "Outbox: DeliveryStatusChanged")
+Rel(billDb, kafka, "Outbox: InvoiceIssued")
+Rel(payDb, kafka, "Outbox: PaymentConfirmed")
+Rel(kafka, payment, "InvoiceIssued / InvoiceCancelled → разрешённые к оплате счета")
+Rel(kafka, soc, "Журналы аудита")
+Rel(apigw, idp, "Федерация сотрудников")
+Rel(kafka, c360, "Проекция")
+Rel(crm, apigw, "API Customer 360 (токены) + детокенизация по ABAC")
+Rel(apigw, c360, "")
+Rel(apigw, profile, "Детокенизация по ABAC: оператор CRM по обращению")
+Rel(bffm, profile, "Адрес/телефон получателя только на время рейса (ABAC)")
+Rel(kafka, ch, "analytics.*")
+Rel(kafka, dwh, "Обезличенные события ≤ 5 с")
+@enduml
